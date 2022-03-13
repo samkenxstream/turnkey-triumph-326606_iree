@@ -1,0 +1,2 @@
+add_mlir_interface(TransformOpInterface)
+add_mlir_dialect(LinalgTransformOps iree_linalg_transform)
