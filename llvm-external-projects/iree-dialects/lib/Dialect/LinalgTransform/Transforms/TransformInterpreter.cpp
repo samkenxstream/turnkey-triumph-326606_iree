@@ -21,6 +21,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/SourceMgr.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Arithmetic/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -39,7 +41,9 @@
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Support/FileUtilities.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 
@@ -48,6 +52,12 @@
 
 using namespace mlir;
 using namespace mlir::linalg;
+
+static llvm::cl::opt<std::string> clTransformFileName(
+    "linalg-transform-file-name",
+    llvm::cl::desc("mlir file containing a top-level module that specifies "
+                   "the transformations to apply."),
+    llvm::cl::init(""));
 
 //===----------------------------------------------------------------------===//
 // Linalg Interpreter Driver
@@ -128,7 +138,7 @@ static LogicalResult checkedListenerTransform(
 /// produced by previous transformations as indicated by SSA value flow in the
 /// Linalg Transform dialect.
 static LogicalResult executeSequence(linalg::transform::SequenceOp sequence,
-                                     ModuleOp module) {
+                                     Operation *module) {
   MLIRContext *ctx = module->getContext();
   RewritePatternSet patternList(ctx);
   for (Dialect *dialect : ctx->getLoadedDialects())
@@ -193,7 +203,16 @@ static LogicalResult executeSequence(linalg::transform::SequenceOp sequence,
     // TODO: this runs CSE internally, mostly redundant with the above.
     if (failed(checkedListenerTransform(
             [&](TrackingListener &listener) {
-              return performEnablerTransformations(module, listener);
+              // return performEnablerTransformations(module, listener);
+
+              linalg::LinalgEnablingOptions options;
+              auto res = module->walk([&](FuncOp func) {
+                if (failed(
+                        performEnablerTransformations(func, listener, options)))
+                  return WalkResult::interrupt();
+                return WalkResult::advance();
+              });
+              return failure(res.wasInterrupted());
             },
             listener))) {
       LLVM_DEBUG(DBGS() << "enabler transformations failed\n");
@@ -260,16 +279,30 @@ struct InterpreterPass : public PassWrapper<InterpreterPass, Pass> {
   }
 
   void runOnOperation() override {
-    auto module = dyn_cast<ModuleOp>(getOperation());
+    if (clTransformFileName.empty()) return signalPassFailure();
+
+    std::string errorMessage;
+    auto memoryBuffer = openInputFile(clTransformFileName, &errorMessage);
+    if (!memoryBuffer) {
+      llvm::errs() << errorMessage << "\n";
+      return signalPassFailure();
+    }
+    // Tell sourceMgr about this buffer, which is what the parser will pick up.
+    llvm::SourceMgr sourceMgr;
+    sourceMgr.AddNewSourceBuffer(std::move(memoryBuffer), llvm::SMLoc());
+    OwningOpRef<ModuleOp> module(
+        parseSourceFile<ModuleOp>(sourceMgr, getOperation()->getContext()));
     if (!module) return signalPassFailure();
 
-    auto result = module.walk([&](linalg::transform::SequenceOp sequenceOp) {
-      if (failed(executeSequence(sequenceOp, module)))
+    auto result = module->walk([&](linalg::transform::SequenceOp sequenceOp) {
+      if (failed(executeSequence(sequenceOp, getOperation())))
         return WalkResult::interrupt();
       return WalkResult::advance();
     });
-
     if (result.wasInterrupted()) signalPassFailure();
+
+    module->dump();
+    abort();
   }
 };
 
@@ -288,10 +321,7 @@ struct DropScheduleFromModulePass
   }
 
   void runOnOperation() override {
-    auto module = dyn_cast<ModuleOp>(getOperation());
-    if (!module) return signalPassFailure();
-
-    module.walk([&](Operation *nestedOp) {
+    getOperation()->walk([&](Operation *nestedOp) {
       if (isa<linalg::transform::SequenceOp>(nestedOp) ||
           isa<pdl::PatternOp>(nestedOp))
         nestedOp->erase();
